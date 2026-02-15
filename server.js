@@ -13,6 +13,15 @@ const pool = new Pool({
   ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
+// Product catalog DB (Grand Emotion) — for pulling product images
+const catalogPool = process.env.CATALOG_DATABASE_URL
+  ? new Pool({
+      connectionString: process.env.CATALOG_DATABASE_URL,
+      ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+      max: 3,                    // only need a few connections
+    })
+  : null;
+
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS aged_inventory (
@@ -47,6 +56,46 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_catalog_style ON catalog_images(style);
   `);
   console.log('Database tables ready');
+}
+
+// -- Sync images from Product Catalog (Grand Emotion) DB ------
+async function syncCatalogImages() {
+  if (!catalogPool) {
+    console.log('No CATALOG_DATABASE_URL set — skipping image sync');
+    return;
+  }
+  try {
+    console.log('Syncing product images from catalog DB...');
+    const result = await catalogPool.query(
+      `SELECT base_style, image_url FROM products WHERE image_url IS NOT NULL AND image_url != ''`
+    );
+    if (result.rows.length === 0) {
+      console.log('No images found in catalog DB');
+      return;
+    }
+    // Upsert each image into local catalog_images table
+    let synced = 0;
+    for (const row of result.rows) {
+      if (!row.base_style || !row.image_url) continue;
+      await pool.query(
+        `INSERT INTO catalog_images (style, image_url, updated_at)
+         VALUES ($1, $2, NOW())
+         ON CONFLICT (style) DO UPDATE SET image_url = $2, updated_at = NOW()`,
+        [row.base_style.trim(), row.image_url]
+      );
+      synced++;
+    }
+    // Also update any existing aged_inventory rows that are missing images
+    await pool.query(`
+      UPDATE aged_inventory ai
+      SET image_url = ci.image_url
+      FROM catalog_images ci
+      WHERE ai.style = ci.style AND (ai.image_url IS NULL OR ai.image_url = '')
+    `);
+    console.log(`Synced ${synced} product images from catalog DB`);
+  } catch (err) {
+    console.error('Catalog image sync error:', err.message);
+  }
 }
 
 // -- Helpers -------------------------------------------------
@@ -255,6 +304,21 @@ app.post('/api/import/catalog', upload.single('file'), async (req, res) => {
     res.json({ success: true, images: count });
   } catch (err) {
     console.error('Catalog import error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// -- API: Sync images from Product Catalog DB -----------------
+app.post('/api/sync-catalog-images', async (req, res) => {
+  try {
+    if (!catalogPool) {
+      return res.status(400).json({ error: 'Product catalog database not configured' });
+    }
+    await syncCatalogImages();
+    const countResult = await pool.query('SELECT COUNT(*) FROM catalog_images');
+    res.json({ success: true, totalImages: parseInt(countResult.rows[0].count) });
+  } catch (err) {
+    console.error('Manual catalog sync error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -501,11 +565,9 @@ const REPORT_HTML = `<!DOCTYPE html>
       <div class="upload-status" id="statusLV"></div>
     </div>
     <div class="upload-section" id="dropCatalog">
-      <h3>Product Catalog CSV</h3>
-      <p>Style images &mdash; updates image library without affecting inventory</p>
-      <label class="choose-btn" for="fileCatalog">Choose CSV File</label>
-      <input type="file" id="fileCatalog" accept=".csv" onchange="handleUpload('catalog', this)" />
-      <div class="file-name" id="nameCatalog"></div>
+      <h3>Product Images</h3>
+      <p>Sync images from the Grand Emotion product catalog database</p>
+      <button class="choose-btn" onclick="syncCatalogImages()">Sync Product Images</button>
       <div class="upload-status" id="statusCatalog"></div>
     </div>
   </div>
@@ -694,6 +756,24 @@ async function exportFlagged() {
 }
 
 // -- CSV Upload (Settings) --------------------
+async function syncCatalogImages() {
+  const statusEl = document.getElementById('statusCatalog');
+  statusEl.className = 'upload-status loading';
+  statusEl.textContent = 'Syncing images from product catalog...';
+  statusEl.style.display = 'block';
+  try {
+    const resp = await fetch('/api/sync-catalog-images', { method: 'POST' });
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error);
+    statusEl.className = 'upload-status success';
+    statusEl.textContent = 'Synced! ' + data.totalImages + ' style images in library. Refreshing...';
+    setTimeout(function(){ window.location.reload(); }, 1500);
+  } catch (err) {
+    statusEl.className = 'upload-status error';
+    statusEl.textContent = 'Error: ' + err.message;
+  }
+}
+
 async function handleUpload(type, input) {
   const file = input.files[0];
   if (!file) return;
@@ -748,7 +828,12 @@ loadData();
 </html>`;
 
 // -- Start ---------------------------------------------------
-initDB().then(() => {
+initDB().then(async () => {
+  // Sync images from product catalog on startup
+  await syncCatalogImages();
+  // Re-sync every 6 hours
+  setInterval(syncCatalogImages, 6 * 60 * 60 * 1000);
+
   app.listen(PORT, () => {
     console.log('Aged Inventory Report running on port ' + PORT);
   });
