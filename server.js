@@ -121,19 +121,25 @@ async function getZohoAccessToken() {
   if (zohoAccessToken && Date.now() < tokenExpiry) return zohoAccessToken;
 
   try {
-    // 1. Try reading refresh token from catalog DB
-    let refreshToken = process.env.ZOHO_REFRESH_TOKEN;
+    // 1. Prefer refresh token from catalog DB (has WorkDrive scope)
+    let refreshToken = null;
     let clientId = process.env.ZOHO_CLIENT_ID;
     let clientSecret = process.env.ZOHO_CLIENT_SECRET;
 
-    if (catalogPool && !refreshToken) {
-      const result = await catalogPool.query(
-        'SELECT refresh_token FROM zoho_tokens ORDER BY updated_at DESC LIMIT 1'
-      );
-      if (result.rows.length > 0) {
-        refreshToken = result.rows[0].refresh_token;
+    if (catalogPool) {
+      try {
+        const result = await catalogPool.query(
+          'SELECT refresh_token FROM zoho_tokens ORDER BY updated_at DESC LIMIT 1'
+        );
+        if (result.rows.length > 0) {
+          refreshToken = result.rows[0].refresh_token;
+        }
+      } catch (e) {
+        console.error('Could not read catalog refresh token:', e.message);
       }
     }
+    // Fallback to env var if catalog DB not available
+    if (!refreshToken) refreshToken = process.env.ZOHO_REFRESH_TOKEN;
 
     if (!refreshToken || !clientId || !clientSecret) {
       console.error('Missing Zoho credentials (refresh_token, client_id, or client_secret)');
