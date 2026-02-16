@@ -538,7 +538,7 @@ const REPORT_HTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Aged Inventory &mdash; Jobber Review</title>
+<title>Aged Inventory &mdash; Clearance Report</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f6fa; color: #2d3436; }
@@ -623,7 +623,7 @@ const REPORT_HTML = `<!DOCTYPE html>
 </head>
 <body>
 <div class="header">
-  <h1>Aged Inventory &mdash; Jobber Review</h1>
+  <h1>Aged Inventory &mdash; Clearance Report</h1>
   <p>Low Value Inventory + Product Catalog</p>
   <div class="updated" id="lastUpdated"></div>
   <button class="settings-btn" onclick="document.getElementById('settingsPanel').classList.add('show')">&#9881; Settings</button>
