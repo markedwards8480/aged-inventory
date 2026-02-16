@@ -112,42 +112,31 @@ function sortSizes(sizes) {
 }
 
 // -- Zoho WorkDrive Image Proxy ------------------------------
-// Same pattern as the open-order app — proxies Zoho download
-// URLs through the server so the browser can display them
-// without needing Zoho auth cookies.
-const ZOHO_TOKENS = {
-  refreshToken: process.env.ZOHO_REFRESH_TOKEN,
-  clientId: process.env.ZOHO_CLIENT_ID,
-  clientSecret: process.env.ZOHO_CLIENT_SECRET,
-};
+// Reads the current Zoho access token from the product catalog
+// database (zoho_tokens table) instead of managing its own OAuth.
 let zohoAccessToken = null;
 let tokenExpiry = 0;
 
 async function getZohoAccessToken() {
   if (zohoAccessToken && Date.now() < tokenExpiry) return zohoAccessToken;
-  if (!ZOHO_TOKENS.refreshToken) return null;
+  if (!catalogPool) return null;
 
   try {
-    const resp = await fetch('https://accounts.zoho.com/oauth/v2/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        grant_type: 'refresh_token',
-        refresh_token: ZOHO_TOKENS.refreshToken,
-        client_id: ZOHO_TOKENS.clientId,
-        client_secret: ZOHO_TOKENS.clientSecret,
-      }),
-    });
-    const data = await resp.json();
-    if (data.access_token) {
-      zohoAccessToken = data.access_token;
-      tokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
+    const result = await catalogPool.query(
+      'SELECT access_token, expires_at FROM zoho_tokens ORDER BY updated_at DESC LIMIT 1'
+    );
+    if (result.rows.length > 0) {
+      const row = result.rows[0];
+      zohoAccessToken = row.access_token;
+      // Cache for 30 minutes or until expiry, whichever is sooner
+      const expiresAt = new Date(row.expires_at).getTime();
+      tokenExpiry = Math.min(expiresAt, Date.now() + 30 * 60 * 1000);
       return zohoAccessToken;
     }
-    console.error('Zoho token refresh failed:', data);
+    console.error('No Zoho tokens found in catalog DB');
     return null;
   } catch (err) {
-    console.error('Zoho token error:', err.message);
+    console.error('Zoho token read error:', err.message);
     return null;
   }
 }
