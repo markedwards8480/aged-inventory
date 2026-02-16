@@ -323,6 +323,25 @@ app.post('/api/sync-catalog-images', async (req, res) => {
   }
 });
 
+// -- API: Debug catalog DB ------------------------------------
+app.get('/api/debug-catalog', async (req, res) => {
+  try {
+    if (!catalogPool) return res.json({ error: 'No catalog DB configured' });
+    const total = await catalogPool.query('SELECT COUNT(*) FROM products');
+    const withImg = await catalogPool.query("SELECT COUNT(*) FROM products WHERE image_url IS NOT NULL AND image_url != ''");
+    const sample = await catalogPool.query("SELECT id, style_id, base_style, name, image_url FROM products LIMIT 5");
+    const cols = await catalogPool.query("SELECT column_name FROM information_schema.columns WHERE table_name = 'products' ORDER BY ordinal_position");
+    res.json({
+      totalProducts: total.rows[0].count,
+      withImageUrl: withImg.rows[0].count,
+      columns: cols.rows.map(r => r.column_name),
+      sample: sample.rows
+    });
+  } catch (err) {
+    res.json({ error: err.message });
+  }
+});
+
 // -- API: Report Data ----------------------------------------
 app.get('/api/inventory', async (req, res) => {
   try {
