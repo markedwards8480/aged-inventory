@@ -179,7 +179,11 @@ app.get('/api/image-proxy', async (req, res) => {
     if (token) headers['Authorization'] = `Zoho-oauthtoken ${token}`;
 
     const resp = await fetch(url, { headers, redirect: 'follow' });
-    if (!resp.ok) throw new Error(`Zoho returned ${resp.status}`);
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => '');
+      console.error('Zoho image error:', resp.status, body.substring(0, 200));
+      return res.status(502).json({ zohoStatus: resp.status, detail: body.substring(0, 200), tokenPresent: !!token });
+    }
 
     const contentType = resp.headers.get('content-type') || 'image/jpeg';
     res.set('Content-Type', contentType);
@@ -188,7 +192,7 @@ app.get('/api/image-proxy', async (req, res) => {
     res.send(buffer);
   } catch (err) {
     console.error('Image proxy error:', err.message);
-    res.status(502).send('Image unavailable');
+    res.status(502).json({ error: err.message, tokenPresent: !!zohoAccessToken });
   }
 });
 
