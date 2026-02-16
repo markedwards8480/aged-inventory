@@ -337,6 +337,40 @@ app.post('/api/sync-catalog-images', async (req, res) => {
   }
 });
 
+// -- API: Debug Zoho proxy ------------------------------------
+app.get('/api/debug-zoho', async (req, res) => {
+  try {
+    const hasRefresh = !!process.env.ZOHO_REFRESH_TOKEN;
+    const hasClientId = !!process.env.ZOHO_CLIENT_ID;
+    const hasClientSecret = !!process.env.ZOHO_CLIENT_SECRET;
+    const hasCatalogPool = !!catalogPool;
+
+    let tokenResult = 'skipped';
+    if (hasRefresh && hasClientId && hasClientSecret) {
+      try {
+        const resp = await fetch('https://accounts.zoho.com/oauth/v2/token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({
+            grant_type: 'refresh_token',
+            refresh_token: process.env.ZOHO_REFRESH_TOKEN,
+            client_id: process.env.ZOHO_CLIENT_ID,
+            client_secret: process.env.ZOHO_CLIENT_SECRET,
+          }),
+        });
+        const data = await resp.json();
+        tokenResult = data.access_token ? 'success_len_' + data.access_token.length : JSON.stringify(data);
+      } catch (e) {
+        tokenResult = 'fetch_error: ' + e.message;
+      }
+    }
+
+    res.json({ envVars: { hasRefresh, hasClientId, hasClientSecret, hasCatalogPool }, tokenResult });
+  } catch (err) {
+    res.json({ error: err.message });
+  }
+});
+
 // -- API: Debug catalog DB ------------------------------------
 app.get('/api/debug-catalog', async (req, res) => {
   try {
