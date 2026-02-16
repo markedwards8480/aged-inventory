@@ -152,7 +152,23 @@ app.get('/api/image-proxy', async (req, res) => {
     const headers = {};
     if (token) headers['Authorization'] = `Zoho-oauthtoken ${token}`;
 
-    const resp = await fetch(url, { headers, redirect: 'follow' });
+    // Extract file ID and try WorkDrive API endpoint first (has correct scope)
+    // URL format: https://download-accl.zoho.com/v1/workdrive/download/{fileId}
+    const fileIdMatch = url.match(/\/download\/([a-zA-Z0-9]+)$/);
+    const fileId = fileIdMatch ? fileIdMatch[1] : null;
+
+    let resp;
+    if (fileId) {
+      // Try WorkDrive API endpoint first
+      resp = await fetch(`https://workdrive.zoho.com/api/v1/download/${fileId}`, { headers, redirect: 'follow' });
+      // Fallback to original CDN URL if WorkDrive API fails
+      if (!resp.ok) {
+        resp = await fetch(url, { headers, redirect: 'follow' });
+      }
+    } else {
+      resp = await fetch(url, { headers, redirect: 'follow' });
+    }
+
     if (!resp.ok) {
       const body = await resp.text().catch(() => '');
       console.error('Zoho image error:', resp.status, body.substring(0, 200));
