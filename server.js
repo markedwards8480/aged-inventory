@@ -355,7 +355,8 @@ app.get('/api/debug-zoho', async (req, res) => {
     const hasClientSecret = !!process.env.ZOHO_CLIENT_SECRET;
     const hasCatalogPool = !!catalogPool;
 
-    let tokenResult = 'skipped';
+    // Test with env var token
+    let envTokenResult = 'skipped';
     if (hasRefresh && hasClientId && hasClientSecret) {
       try {
         const resp = await fetch('https://accounts.zoho.com/oauth/v2/token', {
@@ -369,13 +370,50 @@ app.get('/api/debug-zoho', async (req, res) => {
           }),
         });
         const data = await resp.json();
-        tokenResult = data.access_token ? 'success_len_' + data.access_token.length : JSON.stringify(data);
+        envTokenResult = data.access_token ? 'success_len_' + data.access_token.length : JSON.stringify(data);
       } catch (e) {
-        tokenResult = 'fetch_error: ' + e.message;
+        envTokenResult = 'fetch_error: ' + e.message;
       }
     }
 
-    res.json({ envVars: { hasRefresh, hasClientId, hasClientSecret, hasCatalogPool }, tokenResult });
+    // Test with catalog DB token
+    let catalogTokenResult = 'skipped';
+    if (catalogPool && hasClientId && hasClientSecret) {
+      try {
+        const dbResult = await catalogPool.query('SELECT refresh_token FROM zoho_tokens ORDER BY updated_at DESC LIMIT 1');
+        if (dbResult.rows.length > 0) {
+          const resp2 = await fetch('https://accounts.zoho.com/oauth/v2/token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+              grant_type: 'refresh_token',
+              refresh_token: dbResult.rows[0].refresh_token,
+              client_id: process.env.ZOHO_CLIENT_ID,
+              client_secret: process.env.ZOHO_CLIENT_SECRET,
+            }),
+          });
+          const data2 = await resp2.json();
+          if (data2.access_token) {
+            // Quick test: try fetching an image with this token
+            const testUrl = 'https://download-accl.zoho.com/v1/workdrive/download/inkmz027f0d233e3a478fa1609c';
+            const imgResp = await fetch(testUrl, { headers: { 'Authorization': 'Zoho-oauthtoken ' + data2.access_token }, redirect: 'follow' });
+            catalogTokenResult = 'token_ok_image_' + imgResp.status + '_' + (imgResp.headers.get('content-type') || 'none').split(';')[0];
+          } else {
+            catalogTokenResult = JSON.stringify(data2);
+          }
+        } else {
+          catalogTokenResult = 'no_tokens_in_db';
+        }
+      } catch (e) {
+        catalogTokenResult = 'error: ' + e.message;
+      }
+    }
+
+    // Also clear cached token to force refresh on next image request
+    zohoAccessToken = null;
+    tokenExpiry = 0;
+
+    res.json({ envVars: { hasRefresh, hasClientId, hasClientSecret, hasCatalogPool }, envTokenResult, catalogTokenResult, cacheClearedForNextRequest: true });
   } catch (err) {
     res.json({ error: err.message });
   }
