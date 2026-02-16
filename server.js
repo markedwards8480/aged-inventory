@@ -763,10 +763,9 @@ function buildAgeBars(brackets) {
   }).join('');
 }
 
-// -- Image URL (proxied through server) ------
+// -- Image URL (serve Zoho URLs directly, same as product catalog) --
 function imgSrc(url) {
   if (!url) return '';
-  if (url.includes('zoho.com')) return '/api/image-proxy?url=' + encodeURIComponent(url);
   return url;
 }
 
