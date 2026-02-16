@@ -51,9 +51,18 @@ async function initDB() {
       updated_at TIMESTAMP DEFAULT NOW()
     );
 
+    CREATE TABLE IF NOT EXISTS image_cache (
+      id SERIAL PRIMARY KEY,
+      image_url TEXT UNIQUE,
+      content_type VARCHAR(100) DEFAULT 'image/jpeg',
+      image_data BYTEA,
+      cached_at TIMESTAMP DEFAULT NOW()
+    );
+
     CREATE INDEX IF NOT EXISTS idx_aged_style_color ON aged_inventory(style, color);
     CREATE INDEX IF NOT EXISTS idx_aged_bracket ON aged_inventory(age_bracket);
     CREATE INDEX IF NOT EXISTS idx_catalog_style ON catalog_images(style);
+    CREATE INDEX IF NOT EXISTS idx_image_cache_url ON image_cache(image_url);
   `);
   console.log('Database tables ready');
 }
@@ -140,7 +149,78 @@ async function getZohoAccessToken() {
   }
 }
 
-// Image proxy endpoint
+// Fetch a single image from Zoho (with auth) — used by proxy and pre-cacher
+async function fetchZohoImage(url) {
+  const token = await getZohoAccessToken();
+  const headers = {};
+  if (token) headers['Authorization'] = `Zoho-oauthtoken ${token}`;
+
+  const fileIdMatch = url.match(/\/download\/([a-zA-Z0-9]+)$/);
+  const fileId = fileIdMatch ? fileIdMatch[1] : null;
+
+  let resp;
+  if (fileId) {
+    resp = await fetch(`https://workdrive.zoho.com/api/v1/download/${fileId}`, { headers, redirect: 'follow' });
+    if (!resp.ok) resp = await fetch(url, { headers, redirect: 'follow' });
+  } else {
+    resp = await fetch(url, { headers, redirect: 'follow' });
+  }
+
+  if (!resp.ok) return null;
+
+  const contentType = resp.headers.get('content-type') || 'image/jpeg';
+  const buffer = await resp.buffer();
+  // Only cache if it looks like an image (not an error page)
+  if (buffer.length < 100 || contentType.includes('html') || contentType.includes('json')) return null;
+  return { contentType, buffer };
+}
+
+// Pre-cache all Zoho images in the background (runs after sync)
+let preCaching = false;
+async function preCacheImages() {
+  if (preCaching) return;
+  preCaching = true;
+  try {
+    const result = await pool.query(
+      `SELECT DISTINCT ci.image_url FROM catalog_images ci
+       WHERE ci.image_url IS NOT NULL AND ci.image_url != ''
+         AND ci.image_url LIKE '%zoho.com%'
+         AND NOT EXISTS (SELECT 1 FROM image_cache ic WHERE ic.image_url = ci.image_url)`
+    );
+    if (result.rows.length === 0) {
+      console.log('Image cache: all images already cached');
+      preCaching = false;
+      return;
+    }
+    console.log(`Image cache: ${result.rows.length} images to download...`);
+    let cached = 0, failed = 0;
+    for (const row of result.rows) {
+      try {
+        const img = await fetchZohoImage(row.image_url);
+        if (img) {
+          await pool.query(
+            `INSERT INTO image_cache (image_url, content_type, image_data, cached_at)
+             VALUES ($1, $2, $3, NOW()) ON CONFLICT (image_url) DO NOTHING`,
+            [row.image_url, img.contentType, img.buffer]
+          );
+          cached++;
+        } else {
+          failed++;
+        }
+      } catch (e) {
+        failed++;
+      }
+      // Small delay to avoid flooding Zoho
+      await new Promise(r => setTimeout(r, 200));
+    }
+    console.log(`Image cache: downloaded ${cached}, failed ${failed}`);
+  } catch (err) {
+    console.error('Pre-cache error:', err.message);
+  }
+  preCaching = false;
+}
+
+// Image proxy endpoint — serves from DB cache, fetches from Zoho on miss
 app.get('/api/image-proxy', async (req, res) => {
   const { url } = req.query;
   if (!url || !url.includes('zoho.com')) {
@@ -148,41 +228,35 @@ app.get('/api/image-proxy', async (req, res) => {
   }
 
   try {
-    const token = await getZohoAccessToken();
-    const headers = {};
-    if (token) headers['Authorization'] = `Zoho-oauthtoken ${token}`;
-
-    // Extract file ID and try WorkDrive API endpoint first (has correct scope)
-    // URL format: https://download-accl.zoho.com/v1/workdrive/download/{fileId}
-    const fileIdMatch = url.match(/\/download\/([a-zA-Z0-9]+)$/);
-    const fileId = fileIdMatch ? fileIdMatch[1] : null;
-
-    let resp;
-    if (fileId) {
-      // Try WorkDrive API endpoint first
-      resp = await fetch(`https://workdrive.zoho.com/api/v1/download/${fileId}`, { headers, redirect: 'follow' });
-      // Fallback to original CDN URL if WorkDrive API fails
-      if (!resp.ok) {
-        resp = await fetch(url, { headers, redirect: 'follow' });
-      }
-    } else {
-      resp = await fetch(url, { headers, redirect: 'follow' });
+    // 1. Check local DB cache first
+    const cached = await pool.query(
+      'SELECT content_type, image_data FROM image_cache WHERE image_url = $1', [url]
+    );
+    if (cached.rows.length > 0 && cached.rows[0].image_data) {
+      res.set('Content-Type', cached.rows[0].content_type);
+      res.set('Cache-Control', 'public, max-age=604800'); // 7 days browser cache
+      return res.send(cached.rows[0].image_data);
     }
 
-    if (!resp.ok) {
-      const body = await resp.text().catch(() => '');
-      console.error('Zoho image error:', resp.status, body.substring(0, 200));
-      return res.status(502).json({ zohoStatus: resp.status, detail: body.substring(0, 200), tokenPresent: !!token });
+    // 2. Cache miss — fetch from Zoho
+    const img = await fetchZohoImage(url);
+    if (!img) {
+      return res.status(502).send('Could not fetch image from Zoho');
     }
 
-    const contentType = resp.headers.get('content-type') || 'image/jpeg';
-    res.set('Content-Type', contentType);
-    res.set('Cache-Control', 'public, max-age=86400'); // cache 24h
-    const buffer = await resp.buffer();
-    res.send(buffer);
+    // 3. Store in cache (async, don't block response)
+    pool.query(
+      `INSERT INTO image_cache (image_url, content_type, image_data, cached_at)
+       VALUES ($1, $2, $3, NOW()) ON CONFLICT (image_url) DO NOTHING`,
+      [url, img.contentType, img.buffer]
+    ).catch(e => console.error('Cache store error:', e.message));
+
+    res.set('Content-Type', img.contentType);
+    res.set('Cache-Control', 'public, max-age=604800');
+    res.send(img.buffer);
   } catch (err) {
     console.error('Image proxy error:', err.message);
-    res.status(502).json({ error: err.message, tokenPresent: !!zohoAccessToken });
+    res.status(502).send('Image proxy error');
   }
 });
 
@@ -328,97 +402,6 @@ app.post('/api/sync-catalog-images', async (req, res) => {
   } catch (err) {
     console.error('Manual catalog sync error:', err);
     res.status(500).json({ error: err.message });
-  }
-});
-
-// -- API: Debug Zoho proxy ------------------------------------
-app.get('/api/debug-zoho', async (req, res) => {
-  try {
-    const hasRefresh = !!process.env.ZOHO_REFRESH_TOKEN;
-    const hasClientId = !!process.env.ZOHO_CLIENT_ID;
-    const hasClientSecret = !!process.env.ZOHO_CLIENT_SECRET;
-    const hasCatalogPool = !!catalogPool;
-
-    // Test with env var token
-    let envTokenResult = 'skipped';
-    if (hasRefresh && hasClientId && hasClientSecret) {
-      try {
-        const resp = await fetch('https://accounts.zoho.com/oauth/v2/token', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({
-            grant_type: 'refresh_token',
-            refresh_token: process.env.ZOHO_REFRESH_TOKEN,
-            client_id: process.env.ZOHO_CLIENT_ID,
-            client_secret: process.env.ZOHO_CLIENT_SECRET,
-          }),
-        });
-        const data = await resp.json();
-        envTokenResult = data.access_token ? 'success_len_' + data.access_token.length : JSON.stringify(data);
-      } catch (e) {
-        envTokenResult = 'fetch_error: ' + e.message;
-      }
-    }
-
-    // Test with catalog DB token
-    let catalogTokenResult = 'skipped';
-    if (catalogPool && hasClientId && hasClientSecret) {
-      try {
-        const dbResult = await catalogPool.query('SELECT refresh_token FROM zoho_tokens ORDER BY updated_at DESC LIMIT 1');
-        if (dbResult.rows.length > 0) {
-          const resp2 = await fetch('https://accounts.zoho.com/oauth/v2/token', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: new URLSearchParams({
-              grant_type: 'refresh_token',
-              refresh_token: dbResult.rows[0].refresh_token,
-              client_id: process.env.ZOHO_CLIENT_ID,
-              client_secret: process.env.ZOHO_CLIENT_SECRET,
-            }),
-          });
-          const data2 = await resp2.json();
-          if (data2.access_token) {
-            // Quick test: try fetching an image with this token
-            const testUrl = 'https://download-accl.zoho.com/v1/workdrive/download/inkmz027f0d233e3a478fa1609c';
-            const imgResp = await fetch(testUrl, { headers: { 'Authorization': 'Zoho-oauthtoken ' + data2.access_token }, redirect: 'follow' });
-            catalogTokenResult = 'token_ok_image_' + imgResp.status + '_' + (imgResp.headers.get('content-type') || 'none').split(';')[0];
-          } else {
-            catalogTokenResult = JSON.stringify(data2);
-          }
-        } else {
-          catalogTokenResult = 'no_tokens_in_db';
-        }
-      } catch (e) {
-        catalogTokenResult = 'error: ' + e.message;
-      }
-    }
-
-    // Also clear cached token to force refresh on next image request
-    zohoAccessToken = null;
-    tokenExpiry = 0;
-
-    res.json({ envVars: { hasRefresh, hasClientId, hasClientSecret, hasCatalogPool }, envTokenResult, catalogTokenResult, cacheClearedForNextRequest: true });
-  } catch (err) {
-    res.json({ error: err.message });
-  }
-});
-
-// -- API: Debug catalog DB ------------------------------------
-app.get('/api/debug-catalog', async (req, res) => {
-  try {
-    if (!catalogPool) return res.json({ error: 'No catalog DB configured' });
-    const total = await catalogPool.query('SELECT COUNT(*) FROM products');
-    const withImg = await catalogPool.query("SELECT COUNT(*) FROM products WHERE image_url IS NOT NULL AND image_url != ''");
-    const sample = await catalogPool.query("SELECT id, style_id, base_style, name, image_url FROM products LIMIT 5");
-    const cols = await catalogPool.query("SELECT column_name FROM information_schema.columns WHERE table_name = 'products' ORDER BY ordinal_position");
-    res.json({
-      totalProducts: total.rows[0].count,
-      withImageUrl: withImg.rows[0].count,
-      columns: cols.rows.map(r => r.column_name),
-      sample: sample.rows
-    });
-  } catch (err) {
-    res.json({ error: err.message });
   }
 });
 
@@ -928,10 +911,12 @@ loadData();
 
 // -- Start ---------------------------------------------------
 initDB().then(async () => {
-  // Sync images from product catalog on startup
+  // Sync image URLs from product catalog on startup
   await syncCatalogImages();
+  // Start pre-caching images in the background (don't block startup)
+  preCacheImages();
   // Re-sync every 6 hours
-  setInterval(syncCatalogImages, 6 * 60 * 60 * 1000);
+  setInterval(async () => { await syncCatalogImages(); preCacheImages(); }, 6 * 60 * 60 * 1000);
 
   app.listen(PORT, () => {
     console.log('Aged Inventory Report running on port ' + PORT);
