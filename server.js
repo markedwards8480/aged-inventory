@@ -112,62 +112,30 @@ function sortSizes(sizes) {
 }
 
 // -- Zoho WorkDrive Image Proxy ------------------------------
-// Reads refresh_token from product catalog DB, then refreshes
-// using Zoho OAuth to get a current access token.
+// Reads the active access_token from the product catalog DB.
+// The product catalog app refreshes it regularly with WorkDrive scope.
 let zohoAccessToken = null;
 let tokenExpiry = 0;
 
 async function getZohoAccessToken() {
   if (zohoAccessToken && Date.now() < tokenExpiry) return zohoAccessToken;
+  if (!catalogPool) return null;
 
   try {
-    // 1. Prefer refresh token from catalog DB (has WorkDrive scope)
-    let refreshToken = null;
-    let clientId = process.env.ZOHO_CLIENT_ID;
-    let clientSecret = process.env.ZOHO_CLIENT_SECRET;
-
-    if (catalogPool) {
-      try {
-        const result = await catalogPool.query(
-          'SELECT refresh_token FROM zoho_tokens ORDER BY updated_at DESC LIMIT 1'
-        );
-        if (result.rows.length > 0) {
-          refreshToken = result.rows[0].refresh_token;
-        }
-      } catch (e) {
-        console.error('Could not read catalog refresh token:', e.message);
-      }
-    }
-    // Fallback to env var if catalog DB not available
-    if (!refreshToken) refreshToken = process.env.ZOHO_REFRESH_TOKEN;
-
-    if (!refreshToken || !clientId || !clientSecret) {
-      console.error('Missing Zoho credentials (refresh_token, client_id, or client_secret)');
-      return null;
-    }
-
-    // 2. Do OAuth refresh
-    const resp = await fetch('https://accounts.zoho.com/oauth/v2/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        grant_type: 'refresh_token',
-        refresh_token: refreshToken,
-        client_id: clientId,
-        client_secret: clientSecret,
-      }),
-    });
-    const data = await resp.json();
-    if (data.access_token) {
-      zohoAccessToken = data.access_token;
-      tokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
-      console.log('Zoho token refreshed successfully');
+    const result = await catalogPool.query(
+      'SELECT access_token, expires_at FROM zoho_tokens ORDER BY updated_at DESC LIMIT 1'
+    );
+    if (result.rows.length > 0) {
+      zohoAccessToken = result.rows[0].access_token;
+      const expiresAt = new Date(result.rows[0].expires_at).getTime();
+      // Cache for 5 minutes or until expiry, whichever is sooner
+      tokenExpiry = Math.min(expiresAt - 30000, Date.now() + 5 * 60 * 1000);
       return zohoAccessToken;
     }
-    console.error('Zoho token refresh failed:', data);
+    console.error('No Zoho tokens found in catalog DB');
     return null;
   } catch (err) {
-    console.error('Zoho token error:', err.message);
+    console.error('Zoho token read error:', err.message);
     return null;
   }
 }
@@ -763,9 +731,10 @@ function buildAgeBars(brackets) {
   }).join('');
 }
 
-// -- Image URL (serve Zoho URLs directly, same as product catalog) --
+// -- Image URL (proxy Zoho URLs through server for auth) ------
 function imgSrc(url) {
   if (!url) return '';
+  if (url.includes('zoho.com')) return '/api/image-proxy?url=' + encodeURIComponent(url);
   return url;
 }
 
